@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, re, time
+import os, re, sys, time
 import numpy as np
+from collections import OrderedDict
 from PIL import Image
 import imageio
 from tqdm import tqdm
@@ -34,6 +35,43 @@ def largest_8n1_leq(n):  # 8n+1
 def is_video(path):
     return os.path.isfile(path) and path.lower().endswith(('.mp4','.mov','.avi','.mkv'))
 
+LOW_MEM = os.environ.get("LOW_MEM", "0") == "1"
+
+
+class LazyLQVideo:
+    """Lazily upscales source frames on demand.
+
+    Avoids keeping the full 4x-upscaled sequence (tens of GB) in RAM.
+    The pipeline only needs `v[:, :, a:b, :, :]` access.
+    """
+
+    def __init__(self, src_frames, idx, scale, tW, tH, dtype=torch.bfloat16, cache_size=16):
+        self.src_frames = src_frames
+        self.idx = idx
+        self.scale = scale
+        self.tW = tW
+        self.tH = tH
+        self.dtype = dtype
+        self.cache_size = cache_size
+        self._cache = OrderedDict()
+
+    def _get_frame(self, i):
+        if i in self._cache:
+            self._cache.move_to_end(i)
+            return self._cache[i]
+        img = Image.fromarray(self.src_frames[self.idx[i]]).convert("RGB")
+        img_out = upscale_then_center_crop(img, scale=self.scale, tW=self.tW, tH=self.tH)
+        t = pil_to_tensor_neg1_1(img_out, self.dtype, "cpu")
+        self._cache[i] = t
+        if len(self._cache) > self.cache_size:
+            self._cache.popitem(last=False)
+        return t
+
+    def __getitem__(self, key):
+        frame_slice = key[2]
+        frames = [self._get_frame(i) for i in range(frame_slice.start, frame_slice.stop)]
+        return torch.stack(frames, 0).permute(1, 0, 2, 3).unsqueeze(0)
+
 def pil_to_tensor_neg1_1(img: Image.Image, dtype=torch.bfloat16, device='cuda'):
     t = torch.from_numpy(np.asarray(img, np.uint8)).to(device=device, dtype=torch.float32)  # HWC
     t = t.permute(2,0,1) / 255.0 * 2.0 - 1.0                                              # CHW in [-1,1]
@@ -41,7 +79,7 @@ def pil_to_tensor_neg1_1(img: Image.Image, dtype=torch.bfloat16, device='cuda'):
 
 def save_video(frames, save_path, fps=30, quality=5):
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    w = imageio.get_writer(save_path, fps=fps, quality=quality)
+    w = imageio.get_writer(save_path, fps=fps, codec="libx264", quality=quality)
     for f in tqdm(frames, desc=f"Saving {os.path.basename(save_path)}"):
         w.append_data(np.array(f))
     w.close()
@@ -159,6 +197,17 @@ def prepare_input_tensor(path: str, scale: float = 4, dtype=torch.bfloat16, devi
         idx = idx[:F]
         print(f"[{os.path.basename(path)}] Target Frames (8n-3): {F-4}")
 
+        if LOW_MEM:
+            src_frames = []
+            try:
+                for i in range(total):
+                    src_frames.append(rdr.get_data(i))
+            finally:
+                try: rdr.close()
+                except Exception: pass
+            LQ = LazyLQVideo(src_frames, idx, scale, tW, tH)
+            return LQ, tH, tW, F, fps
+
         frames = []
         try:
             for i in idx:
@@ -200,7 +249,7 @@ def init_pipeline():
 def main():
     RESULT_ROOT = "./results"
     os.makedirs(RESULT_ROOT, exist_ok=True)
-    inputs = [
+    inputs = sys.argv[1:] or [
         "./inputs/example4.mp4",
     ]
     seed, scale, dtype, device = 0, 4.0, torch.bfloat16, 'cuda'
@@ -217,17 +266,33 @@ def main():
         except Exception as e:
             print(f"[Error] {name}: {e}"); continue
 
-        video = pipe(
+        call_kwargs = dict(
             prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed,
             LQ_video=LQ, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
-            topk_ratio=sparse_ratio*768*1280/(th*tw), 
+            topk_ratio=sparse_ratio*768*1280/(th*tw),
             kv_ratio=3.0,
             local_range=11,  # Recommended: 9 or 11. local_range=9 → sharper details; 11 → more stable results.
-            color_fix = True,
+            color_fix=True,
         )
+        save_path = os.path.join(RESULT_ROOT, f"FlashVSR_v1.1_Tiny_Long_{name.split('.')[0]}_seed{seed}.mp4")
 
-        video = tensor2video(video)
-        save_video(video, os.path.join(RESULT_ROOT, f"FlashVSR_v1.1_Tiny_Long_{name.split('.')[0]}_seed{seed}.mp4"), fps=fps, quality=5)
+        if LOW_MEM:
+            writer = imageio.get_writer(save_path, fps=fps, codec="libx264", quality=5)
+
+            def on_chunk(chunk, writer=writer):
+                frames = chunk[0].permute(1, 2, 3, 0).float()
+                frames = ((frames + 1) * 127.5).clamp(0, 255).to(torch.uint8).numpy()
+                for frame in frames:
+                    writer.append_data(frame)
+
+            try:
+                pipe(frame_callback=on_chunk, **call_kwargs)
+            finally:
+                writer.close()
+        else:
+            video = pipe(**call_kwargs)
+            video = tensor2video(video)
+            save_video(video, save_path, fps=fps, quality=5)
 
     print("Done.")
 

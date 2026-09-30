@@ -437,6 +437,18 @@ class GateModule(nn.Module):
         return x + gate * residual
 
 
+_FFN_CHUNK_SIZE = int(os.environ.get("FLASHVSR_FFN_CHUNK", "0"))
+
+
+def chunked_ffn(ffn, x):
+    if _FFN_CHUNK_SIZE <= 0 or x.shape[1] <= _FFN_CHUNK_SIZE:
+        return ffn(x)
+    return torch.cat(
+        [ffn(x[:, i:i + _FFN_CHUNK_SIZE]) for i in range(0, x.shape[1], _FFN_CHUNK_SIZE)],
+        dim=1,
+    )
+
+
 class DiTBlock(nn.Module):
     def __init__(self, dim: int, num_heads: int, ffn_dim: int, eps: float = 1e-6):
         super().__init__()
@@ -469,7 +481,7 @@ class DiTBlock(nn.Module):
         x = self.gate(x, gate_msa, self_attn_output)
         x = x + self.cross_attn(self.norm3(x), context, is_stream=is_stream)
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
-        x = self.gate(x, gate_mlp, self.ffn(input_x))
+        x = self.gate(x, gate_mlp, chunked_ffn(self.ffn, input_x))
         if is_stream:
             return x, self_attn_cache_k, self_attn_cache_v
         return x

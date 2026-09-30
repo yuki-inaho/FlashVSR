@@ -11,11 +11,30 @@ build/
 
 # Virtual environments
 venv/
-.env/
+.env
+.env.*
+.venv/
 
-# Logs
+# Model weights (downloaded from HuggingFace)
+examples/WanVSR/FlashVSR/
+examples/WanVSR/FlashVSR-v1.1/
+*.pth
+*.ckpt
+*.safetensors
+!examples/WanVSR/prompt_tensor/*.pth
+
+# Inference outputs / generated artifacts (videos, tile memmaps, etc.)
+examples/WanVSR/results/
+outputs/
+*.npy
+
+# Logs and temporary work
 *.log
+logs/
+tmp/
+temp/
 
-# IDE files
+# IDE / OS files
 .vscode/
 .idea/
+.DS_Store

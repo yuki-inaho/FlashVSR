@@ -306,6 +306,7 @@ class FlashVSRTinyLongPipeline(BasePipeline):
         kv_ratio=3.0,
         local_range = 9,
         color_fix = True,
+        frame_callback = None,
     ):
         # 只接受 cfg=1.0（与原代码一致）
         assert cfg_scale == 1.0, "cfg_scale must be 1.0"
@@ -425,9 +426,14 @@ class FlashVSRTinyLongPipeline(BasePipeline):
                 except:
                     pass
 
-                frames_total.append(cur_frames.to('cpu'))
+                if frame_callback is not None:
+                    frame_callback(cur_frames.to('cpu'))
+                else:
+                    frames_total.append(cur_frames.to('cpu'))
                 LQ_pre_idx = LQ_cur_idx
 
+            if frame_callback is not None:
+                return None
             frames = torch.cat(frames_total, dim=2)
 
         return frames[0]
